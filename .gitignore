@@ -1,0 +1,92 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+.tox/
+*.coverage
+*.coverage.*
+.coverage
+.cache
+nosetests.xml
+coverage.xml
+*,cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# pyenv
+python-version
+
+# venv
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# macOS
+.DS_Store
+
+# Logs and runtime files
+logs/
+*.log
+*.log.*
+
+# Saved models and checkpoints
+/saved_models/
+*.pth
+*.ckpt
+best_*.pth
+
+# Large data and precomputed features (optional: uncomment to ignore)
+data/
+data/**/frame_ViT/
+data/**/clap/
+data/**/annots/
+pretrained/
+
+# Numpy cache or arrays (if generated at runtime)
+# Note: currently commented out to avoid accidentally ignoring dataset features.
+# Uncomment the next line to ignore all .npy files in git
+*.npy
+
+# Temporary files
+*.tmp
+*.swp
+
+# Ignore system-specific files
+thumbs.db
+ehthumbs.db
