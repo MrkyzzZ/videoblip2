@@ -19,15 +19,25 @@ from videoblip2.training.config import TrainConfig
 
 
 def _parse_gpu_ids(raw: Optional[str]) -> Optional[List[int]]:
-    if raw is None or raw.strip() == "":
+    if raw is None:
         return None
-    ids = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        ids.append(int(part))
-    return ids or None
+    if isinstance(raw, (list, tuple)):
+        ids = [int(item) for item in raw if str(item).strip() != ""]
+        return ids or None
+    if isinstance(raw, int):
+        return [raw]
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if raw == "":
+            return None
+        ids = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            ids.append(int(part))
+        return ids or None
+    raise TypeError(f"无法解析 GPU ID: 类型 {type(raw)}")
 
 
 def main():
@@ -35,7 +45,7 @@ def main():
     parser.add_argument(
         "--gpu_ids",
         type=str,
-        default=None,
+        default=0,
         help="使用的 GPU ID 列表，如 '0,1,2,3'；留空则自动检测",
     )
     args = parser.parse_args()

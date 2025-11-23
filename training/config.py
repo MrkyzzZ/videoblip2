@@ -10,10 +10,10 @@ class TrainConfig:
     # ==============================================================================
     # --- 数据和模型路径 ---
     # ==============================================================================
-    TRAIN_ANNOTATIONS_PATH = "/root/autodl-tmp/videoblip2/data/annots/music_avqa_train.json"
-    TEST_ANNOTATIONS_PATH  = "/root/autodl-tmp/videoblip2/data/annots/music_avqa_test.json"
-    VIDEO_FEATURES_DIR   = "/root/autodl-tmp/videoblip2/data/frame_ViT"
-    AUDIO_FEATURES_DIR   = "/root/autodl-tmp/videoblip2/data/clap"
+    TRAIN_ANNOTATIONS_PATH = "/root/autodl-tmp/videoblip2/data/MSRVTT_annots/train.json"
+    TEST_ANNOTATIONS_PATH  = "/root/autodl-tmp/videoblip2/data/MSRVTT_annots/test.json"
+    VIDEO_FEATURES_DIR   = "/root/autodl-tmp/videoblip2/data/MSRVTT_frame_ViT"
+    AUDIO_FEATURES_DIR   = "/root/autodl-tmp/videoblip2/data/MSRVTT_clap"
     T5_MODEL_PATH        = "/root/autodl-tmp/videoblip2/pretrained/flan-t5-base"
     BERT_TOKENIZER_PATH  = "/root/autodl-tmp/videoblip2/pretrained/bert-base-uncased"
 
@@ -39,7 +39,8 @@ class TrainConfig:
     # ==============================================================================
     NUM_QUERY_TOKEN    = 32
     QFORMER_NUM_LAYERS   = 6
-
+    DEFAULT_QUESTION_PROMPT ="Describe the video content in detail."
+    
     # LoRA 相关参数
     LORA_R       = 16
     LORA_ALPHA   = 32

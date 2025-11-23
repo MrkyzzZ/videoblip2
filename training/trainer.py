@@ -11,6 +11,7 @@ import torch.nn as nn
 from tqdm import tqdm
 import numpy as np
 import logging
+import random
 from torch.optim import AdamW
 from datetime import datetime
 from transformers import get_cosine_schedule_with_warmup
@@ -52,14 +53,70 @@ class Trainer:
 
         # 数据加载
         train_anns      = json.load(open(config.TRAIN_ANNOTATIONS_PATH, 'r'))
-        self.test_anns  = json.load(open(config.TEST_ANNOTATIONS_PATH, 'r'))
-        self.answer_to_label = {ans: i for i, ans in enumerate(sorted(list(set(item['anser'] for item in train_anns))))}
+        
+        # 尝试加载完整的测试集标注 (test_videodatainfo.json)
+        test_ann_path = config.TEST_ANNOTATIONS_PATH
+        test_videodatainfo_path = os.path.join(os.path.dirname(test_ann_path), "test_videodatainfo.json")
+        
+        if os.path.exists(test_videodatainfo_path):
+            logging.info(f"检测到完整的测试集标注文件: {test_videodatainfo_path}，正在加载并转换格式...")
+            
+            # 1. 加载原始 test.json 以获取正确的测试集 Video ID 列表 (避免数据泄漏)
+            original_test_data = json.load(open(test_ann_path, 'r'))
+            valid_test_video_ids = set()
+            for item in original_test_data:
+                vid = item.get('video_id') or item.get('id') or item.get('video')
+                if vid:
+                    valid_test_video_ids.add(str(vid))
+            logging.info(f"原始测试集包含 {len(valid_test_video_ids)} 个视频 ID。")
+
+            # 2. 加载包含完整字幕的 test_videodatainfo.json
+            raw_test_data = json.load(open(test_videodatainfo_path, 'r'))
+            
+            # 将扁平的 caption 列表转换为按 video_id 聚合的格式
+            video_to_captions = {}
+            if isinstance(raw_test_data, dict) and "sentences" in raw_test_data:
+                raw_test_data = raw_test_data["sentences"]
+            
+            for item in raw_test_data:
+                vid = str(item.get('video_id'))
+                cap = item.get('caption')
+                
+                # 关键：只保留在原始 test.json 中存在的视频，过滤掉可能存在于训练集中的视频
+                if vid not in valid_test_video_ids:
+                    continue
+                    
+                if not vid or not cap:
+                    continue
+                
+                if vid not in video_to_captions:
+                    video_to_captions[vid] = []
+                video_to_captions[vid].append(cap)
+            
+            self.test_anns = []
+            for vid, caps in video_to_captions.items():
+                self.test_anns.append({
+                    "video_id": vid,
+                    "caption": caps,
+                    "video": f"{vid}.mp4" 
+                })
+            logging.info(f"成功加载并过滤测试集，共 {len(self.test_anns)} 个视频样本 (已过滤掉非测试集视频)。")
+            
+        else:
+            logging.warning(f"未找到 {test_videodatainfo_path}，回退到使用 {test_ann_path}")
+            self.test_anns  = json.load(open(test_ann_path, 'r'))
+
         self.train_data = train_anns
-        num_classes     = len(self.answer_to_label)
+        self.max_target_length = getattr(config, "MAX_TARGET_LENGTH", 32)
+        self.default_question_prompt = getattr(
+            config,
+            "DEFAULT_QUESTION_PROMPT",
+            "Describe the video content in detail."
+        )
 
         # 初始化模型
         base_model = MultiModal_T5_Classifier(
-            num_classes=num_classes,
+            num_classes=0,
             t5_model_path=config.T5_MODEL_PATH,
             qformer_num_layers=config.QFORMER_NUM_LAYERS,
             num_query_token=config.NUM_QUERY_TOKEN,
@@ -81,7 +138,6 @@ class Trainer:
 
         # 优化器设置
         self.optimizer = AdamW(filter(lambda p: p.requires_grad, self.model.parameters()), lr=config.LEARNING_RATE)
-        self.criterion = nn.CrossEntropyLoss()
 
         # 学习率调度器
         steps_per_epoch          = max(1, math.ceil(len(self.train_data) / self.config.BATCH_SIZE))
@@ -94,6 +150,7 @@ class Trainer:
         )
 
         self.best_accuracy = 0.0
+        self._nltk_ready = False
         os.makedirs(config.SAVE_DIR, exist_ok=True)
         logging.info("Trainer 初始化完成。")
         logging.info(f"总训练步数: {self.total_training_steps}, Warmup 步数: {self.warmup_steps}")
@@ -109,25 +166,125 @@ class Trainer:
         with open(self.log_file_path, 'w') as f:
             f.write(log_message)
 
-    def _prepare_batch(self, annotations):
+    def _prepare_batch(self, annotations, training=True):
         """准备训练批次数据"""
-        video_feats_list, audio_feats_list, questions, labels = [], [], [], []
+        video_feats_list, audio_feats_list, questions, captions = [], [], [], []
         for ann in annotations:
-            video_id, question, answer = ann['video_id'], ann['question_content'], ann['anser']
-            video_path = os.path.join(self.config.VIDEO_FEATURES_DIR, f"{video_id}.npy")
-            audio_path = os.path.join(self.config.AUDIO_FEATURES_DIR, f"{video_id}.npy")
-            if not os.path.exists(video_path) or not os.path.exists(audio_path):
+            video_id = ann.get('video_id') or ann.get('id') or ann.get('video')
+            if video_id is None:
+                video_name = ann.get('video') or ann.get('video_name') or ann.get('media')
+                if video_name:
+                    video_id = os.path.splitext(os.path.basename(str(video_name)))[0]
+            if video_id is None:
                 continue
+            video_id = str(video_id)
+
+            question = (
+                ann.get('question_content')
+                or ann.get('question')
+                or ann.get('prompt')
+                or ann.get('caption_prompt')
+                or self.default_question_prompt
+            )
+            if isinstance(question, list):
+                question = " ".join(str(q) for q in question if q)
+            if question is None:
+                question = self.default_question_prompt
+            else:
+                question = str(question)
+
+            answer = ann.get('anser') or ann.get('caption') or ann.get('answer')
+            if isinstance(answer, list):
+                filtered_answers = [str(a) for a in answer if a]
+                if not filtered_answers:
+                    continue
+                answer = random.choice(filtered_answers) if training else filtered_answers[0]
+            if not answer:
+                continue
+            answer = str(answer)
+
+            video_path = ann.get('video_feature_path')
+            if video_path:
+                video_path = video_path if os.path.isabs(video_path) else os.path.join(self.config.VIDEO_FEATURES_DIR, video_path)
+            else:
+                video_path = os.path.join(self.config.VIDEO_FEATURES_DIR, f"{video_id}.npy")
+
+            audio_path = ann.get('clap_feature_path')
+            if audio_path:
+                audio_path = audio_path if os.path.isabs(audio_path) else os.path.join(self.config.AUDIO_FEATURES_DIR, audio_path)
+            else:
+                audio_path = os.path.join(self.config.AUDIO_FEATURES_DIR, f"{video_id}.npy")
+
+            if not os.path.exists(video_path):
+                continue
+
+            if not os.path.exists(audio_path):
+                continue
+
             video_feats_list.append(torch.from_numpy(np.load(video_path)).float())
             audio_feats_list.append(torch.from_numpy(np.load(audio_path)).float())
             questions.append(question)
-            labels.append(self.answer_to_label.get(answer, -1))
+            
+            # 处理答案/字幕
+            raw_answer = ann.get('anser') or ann.get('caption') or ann.get('answer')
+            all_answers_for_sample = []
+            
+            if isinstance(raw_answer, list):
+                all_answers_for_sample = [str(a) for a in raw_answer if a]
+                if not all_answers_for_sample:
+                    continue
+                # 训练时随机采样一个作为目标；评估时取第一个用于计算Loss，但保留所有用于计算指标
+                selected_answer = random.choice(all_answers_for_sample) if training else all_answers_for_sample[0]
+            else:
+                # 单个字符串的情况
+                if not raw_answer:
+                    continue
+                selected_answer = str(raw_answer)
+                all_answers_for_sample = [selected_answer]
+
+            captions.append(selected_answer)
+            # 额外返回该样本的所有参考答案，用于评估
+            if not hasattr(self, '_temp_all_captions_list'):
+                self._temp_all_captions_list = []
+            self._temp_all_captions_list.append(all_answers_for_sample)
+
         if not questions:
             return None
+            
+        # 获取并清空临时列表
+        all_captions_batch = getattr(self, '_temp_all_captions_list', [])
+        self._temp_all_captions_list = []
+        
         video_batch  = nn.utils.rnn.pad_sequence(video_feats_list, batch_first=True).to(self.device)
         audio_batch  = nn.utils.rnn.pad_sequence(audio_feats_list, batch_first=True).to(self.device)
-        labels_batch = torch.tensor(labels, dtype=torch.long).to(self.device)
-        return video_batch, audio_batch, questions, labels_batch
+        
+        return video_batch, audio_batch, questions, captions, all_captions_batch
+
+    def _build_target_tokens(self, captions):
+        tokens = self.t5_tokenizer(
+            captions,
+            padding="longest",
+            truncation=True,
+            max_length=self.max_target_length,
+            return_tensors="pt"
+        ).input_ids.to(self.device)
+        labels = tokens.clone()
+        labels[labels == self.t5_tokenizer.pad_token_id] = -100
+        return labels
+
+    def _ensure_nltk_resources(self):
+        if self._nltk_ready:
+            return
+        try:
+            import nltk
+            try:
+                nltk.data.find('tokenizers/punkt')
+            except LookupError:
+                nltk.download('punkt', quiet=True)
+        except Exception as exc:
+            logging.warning(f"NLTK 'punkt' 资源不可用，自动指标可能失效: {exc}")
+        finally:
+            self._nltk_ready = True
 
     @staticmethod
     def _parse_types(annotations):
@@ -153,15 +310,16 @@ class Trainer:
             progress_bar = tqdm(range(0, len(self.train_data), self.config.BATCH_SIZE), desc=f"Epoch {epoch+1}/{self.config.EPOCHS}")
             for i in progress_bar:
                 batch_anns = self.train_data[i : i + self.config.BATCH_SIZE]
-                batch = self._prepare_batch(batch_anns)
+                batch = self._prepare_batch(batch_anns, training=True)
                 if batch is None:
                     continue
 
-                video_feats, audio_feats, questions, labels = batch
+                video_feats, audio_feats, questions, captions, _ = batch
+                labels = self._build_target_tokens(captions)
 
                 self.optimizer.zero_grad()
-                logits = self.model(video_feats, audio_feats, questions)
-                loss   = self.criterion(logits, labels)
+                outputs = self.model(video_feats, audio_feats, questions, labels=labels, generate=False)
+                loss = outputs['lm_outputs'].loss if outputs['lm_outputs'] is not None else torch.tensor(0.0, device=self.device)
                 loss.backward()
 
                 self.optimizer.step()
@@ -174,106 +332,134 @@ class Trainer:
             self.evaluate(epoch)
 
     def evaluate(self, epoch):
-        """评估模型性能"""
+        """评估模型性能，包含 BLEU-1, BLEU-4, METEOR, ROUGE-L, CIDEr"""
         self.model.eval()
 
-        per_type = {
-            ("Audio", "Counting"):      {"correct": 0, "total": 0},
-            ("Audio", "Comparative"):   {"correct": 0, "total": 0},
-            ("Visual", "Counting"):     {"correct": 0, "total": 0},
-            ("Visual", "Location"):     {"correct": 0, "total": 0},
-            ("Audio-Visual", "Existential"): {"correct": 0, "total": 0},
-            ("Audio-Visual", "Counting"):    {"correct": 0, "total": 0},
-            ("Audio-Visual", "Location"):    {"correct": 0, "total": 0},
-            ("Audio-Visual", "Comparative"): {"correct": 0, "total": 0},
-            ("Audio-Visual", "Temporal"):    {"correct": 0, "total": 0},
-        }
+        import nltk
+        from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+        try:
+            from rouge import Rouge
+        except ImportError:
+            Rouge = None
+        try:
+            from pycocoevalcap.meteor.meteor import Meteor
+        except ImportError:
+            Meteor = None
+        try:
+            from pycocoevalcap.cider.cider import Cider
+        except ImportError:
+            Cider = None
 
-        total_correct, total_samples = 0, 0
+        self._ensure_nltk_resources()
+
+        total_loss = 0.0
+        total_samples = 0
+        exact_matches = 0
+        all_preds = []
+        all_refs = []
 
         with torch.no_grad():
             for i in tqdm(range(0, len(self.test_anns), self.config.BATCH_SIZE), desc="Evaluating"):
                 batch_anns = self.test_anns[i : i + self.config.BATCH_SIZE]
                 if not batch_anns:
                     continue
-                types_this_batch = self._parse_types(batch_anns)
-
-                batch = self._prepare_batch(batch_anns)
+                batch = self._prepare_batch(batch_anns, training=False)
                 if batch is None:
                     continue
-                video_feats, audio_feats, questions, labels = batch
-
-                valid_mask = labels != -1
-                if not valid_mask.any():
+                video_feats, audio_feats, questions, captions, batch_all_captions = batch
+                if not captions:
+                    continue
+                labels = self._build_target_tokens(captions)
+                if labels.size(0) == 0:
                     continue
 
-                logits = self.model(
-                    video_feats[valid_mask],
-                    audio_feats[valid_mask],
-                    [q for j, q in enumerate(questions) if valid_mask[j]]
-                )
-                predictions = torch.argmax(logits, dim=1)
+                outputs = self.model(video_feats, audio_feats, questions, labels=labels, generate=True)
 
-                total_correct += (predictions == labels[valid_mask]).sum().item()
-                total_samples += valid_mask.sum().item()
+                lm_out = outputs['lm_outputs']
+                if lm_out is not None and lm_out.loss is not None:
+                    total_loss += lm_out.loss.item() * labels.size(0)
+                total_samples += labels.size(0)
 
-                idxs = [idx for idx, ok in enumerate(valid_mask.tolist()) if ok]
-                for k, idx in enumerate(idxs):
-                    key = types_this_batch[idx]
-                    if key in per_type:
-                        per_type[key]["total"] += 1
-                        if predictions[k].item() == labels[idx].item():
-                            per_type[key]["correct"] += 1
+                preds = outputs.get('generated_text') or []
+                if len(preds) != len(captions):
+                    if len(preds) < len(captions):
+                        logging.warning(
+                            "生成结果数量({}) 与有效样本数({}) 不一致，使用空字符串填充缺失预测。".format(len(preds), len(captions))
+                        )
+                        preds = preds + [""] * (len(captions) - len(preds))
+                    else:
+                        preds = preds[:len(captions)]
+                
+                # Exact Match 仍然只对比选中的那个（通常是第一个），或者也可以改为对比所有
+                for pred, refs in zip(preds, batch_all_captions):
+                    # 只要匹配任何一个参考答案就算 Exact Match
+                    if any(pred.strip().lower() == r.strip().lower() for r in refs):
+                        exact_matches += 1
+                        
+                all_preds.extend(preds)
+                all_refs.extend(batch_all_captions)
 
-        def _safe_acc(c, n): return (c / n * 100.0) if n > 0 else 0.0
-        accuracy = _safe_acc(total_correct, total_samples)
-        is_best  = accuracy > self.best_accuracy
+        avg_loss = total_loss / max(1, total_samples)
+        accuracy = (exact_matches / max(1, total_samples)) * 100.0
+        is_best = accuracy > self.best_accuracy
 
-        audio_count = per_type[("Audio", "Counting")]
-        audio_comp  = per_type[("Audio", "Comparative")]
-        audio_avg_c = audio_count["correct"] + audio_comp["correct"]
-        audio_avg_n = audio_count["total"]   + audio_comp["total"]
-        audio_avg   = _safe_acc(audio_avg_c, audio_avg_n)
+        # 计算 BLEU-1, BLEU-4, METEOR, ROUGE-L, CIDEr
+        bleu1s, bleu4s = [], []
+        rouge_l_scores = []
+        smooth = SmoothingFunction().method1
+        rouge_eval = Rouge() if Rouge else None
+        
+        # all_refs 现在是 list of lists (每个样本有多个参考答案)
+        for pred, refs in zip(all_preds, all_refs):
+            # refs 是一个字符串列表
+            ref_tokens_list = [nltk.word_tokenize(r.lower()) for r in refs]
+            pred_tokens = nltk.word_tokenize(pred.lower())
+            
+            # sentence_bleu 接受 list of list of tokens 作为 references
+            bleu1s.append(sentence_bleu(ref_tokens_list, pred_tokens, weights=(1, 0, 0, 0), smoothing_function=smooth))
+            bleu4s.append(sentence_bleu(ref_tokens_list, pred_tokens, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smooth))
+            
+            if rouge_eval:
+                try:
+                    # 计算与每个参考答案的 Rouge-L，取最大值
+                    scores = [rouge_eval.get_scores(pred, r)[0]['rouge-l']['f'] for r in refs]
+                    rouge_l_scores.append(max(scores) if scores else 0.0)
+                except Exception:
+                    rouge_l_scores.append(0.0)
 
-        visual_count = per_type[("Visual", "Counting")]
-        visual_loc   = per_type[("Visual", "Location")]
-        visual_avg_c = visual_count["correct"] + visual_loc["correct"]
-        visual_avg_n = visual_count["total"]   + visual_loc["total"]
-        visual_avg   = _safe_acc(visual_avg_c, visual_avg_n)
+        bleu1 = sum(bleu1s) / max(1, len(bleu1s))
+        bleu4 = sum(bleu4s) / max(1, len(bleu4s))
+        rouge_l = sum(rouge_l_scores) / max(1, len(rouge_l_scores)) if rouge_l_scores else 0.0
 
-        av_exist = per_type[("Audio-Visual", "Existential")]
-        av_count = per_type[("Audio-Visual", "Counting")]
-        av_loc   = per_type[("Audio-Visual", "Location")]
-        av_comp  = per_type[("Audio-Visual", "Comparative")]
-        av_temp  = per_type[("Audio-Visual", "Temporal")]
-        av_avg_c = av_exist["correct"] + av_count["correct"] + av_loc["correct"] + av_comp["correct"] + av_temp["correct"]
-        av_avg_n = av_exist["total"]   + av_count["total"]   + av_loc["total"]   + av_comp["total"]   + av_temp["total"]
-        av_avg   = _safe_acc(av_avg_c, av_avg_n)
+        meteor = 0.0
+        if Meteor and all_preds and all_refs:
+            try:
+                meteor_eval = Meteor()
+                # pycocoevalcap 期望 {idx: [ref1, ref2...]}
+                refs_dict = {idx: refs for idx, refs in enumerate(all_refs)}
+                preds_dict = {idx: [pred] for idx, pred in enumerate(all_preds)}
+                meteor, _ = meteor_eval.compute_score(refs_dict, preds_dict)
+            except Exception as exc:
+                logging.warning(f"METEOR 计算失败: {exc}")
 
-        header = f"-------------- Epoch: {epoch+1}, Accuracy: {accuracy:.4f}%{'  <-- New Best!' if is_best else ''} --------------"
+        cider = 0.0
+        if Cider and all_preds and all_refs:
+            try:
+                cider_eval = Cider()
+                refs_dict = {idx: refs for idx, refs in enumerate(all_refs)}
+                preds_dict = {idx: [pred] for idx, pred in enumerate(all_preds)}
+                cider, _ = cider_eval.compute_score(refs_dict, preds_dict)
+            except Exception as exc:
+                logging.warning(f"CIDEr 计算失败: {exc}")
+
+        header = f"-------------- Epoch: {epoch+1}, Loss: {avg_loss:.4f}, Exact Match: {accuracy:.2f}% BLEU-1: {bleu1:.4f} BLEU-4: {bleu4:.4f} METEOR: {meteor:.4f} ROUGE-L: {rouge_l:.4f} CIDEr: {cider:.4f}{'  <-- New Best!' if is_best else ''} --------------"
         print("\n" + header)
-        print("Audio QA:")
-        print(f"  Count : {_safe_acc(audio_count['correct'], audio_count['total']):.2f}%  (n={audio_count['total']})")
-        print(f"  Comp  : {_safe_acc(audio_comp['correct'],  audio_comp['total']):.2f}%  (n={audio_comp['total']})")
-        print(f"  Avg   : {audio_avg:.2f}%  (n={audio_avg_n})")
-        print("Visual QA:")
-        print(f"  Count : {_safe_acc(visual_count['correct'], visual_count['total']):.2f}%  (n={visual_count['total']})")
-        print(f"  Local : {_safe_acc(visual_loc['correct'],   visual_loc['total']):.2f}%  (n={visual_loc['total']})")
-        print(f"  Avg   : {visual_avg:.2f}%  (n={visual_avg_n})")
-        print("Audio-Visual QA:")
-        print(f"  Exist : {_safe_acc(av_exist['correct'], av_exist['total']):.2f}%  (n={av_exist['total']})")
-        print(f"  Count : {_safe_acc(av_count['correct'], av_count['total']):.2f}%  (n={av_count['total']})")
-        print(f"  Local : {_safe_acc(av_loc['correct'],   av_loc['total']):.2f}%  (n={av_loc['total']})")
-        print(f"  Comp  : {_safe_acc(av_comp['correct'],  av_comp['total']):.2f}%  (n={av_comp['total']})")
-        print(f"  Temp  : {_safe_acc(av_temp['correct'],  av_temp['total']):.2f}%  (n={av_temp['total']})")
-        print(f"  Avg   : {av_avg:.2f}%  (n={av_avg_n})")
-        print(f"\nOverall: {accuracy:.2f}%\n")
 
-        log_lines = [header, "Audio:", f"  Count : {_safe_acc(audio_count['correct'], audio_count['total']):.2f}%  (n={audio_count['total']})", f"  Comp  : {_safe_acc(audio_comp['correct'],  audio_comp['total']):.2f}%  (n={audio_comp['total']})", f"  Avg   : {audio_avg:.2f}%  (n={audio_avg_n})", "Visual:", f"  Count : {_safe_acc(visual_count['correct'], visual_count['total']):.2f}%  (n={visual_count['total']})", f"  Local : {_safe_acc(visual_loc['correct'],   visual_loc['total']):.2f}%  (n={visual_loc['total']})", f"  Avg   : {visual_avg:.2f}%  (n={visual_avg_n})", "Audio-Visual:", f"  Exist : {_safe_acc(av_exist['correct'], av_exist['total']):.2f}%  (n={av_exist['total']})", f"  Count : {_safe_acc(av_count['correct'], av_count['total']):.2f}%  (n={av_count['total']})", f"  Local : {_safe_acc(av_loc['correct'],   av_loc['total']):.2f}%  (n={av_loc['total']})", f"  Comp  : {_safe_acc(av_comp['correct'],  av_comp['total']):.2f}%  (n={av_comp['total']})", f"  Temp  : {_safe_acc(av_temp['correct'],  av_temp['total']):.2f}%  (n={av_temp['total']})", f"  Avg   : {av_avg:.2f}%  (n={av_avg_n})", f"Overall: {accuracy:.2f}%", ""]
         try:
-            with open(self.log_file_path, 'a') as f: f.write("\n".join(log_lines))
+            with open(self.log_file_path, 'a') as f:
+                f.write(header + "\n")
         except Exception as e:
-            logging.error(f"无法将准确率写入日志文件: {e}")
+            logging.error(f"无法将评估结果写入日志文件: {e}")
 
         if is_best:
             self.best_accuracy = accuracy
@@ -295,8 +481,6 @@ class Trainer:
             'audio_upscaler': model_to_save.audio_upscaler.state_dict() if hasattr(model_to_save, 'audio_upscaler') else None,
             'proj_video': model_to_save.proj_video.state_dict() if hasattr(model_to_save, 'proj_video') else None,
             'proj_audio': model_to_save.proj_audio.state_dict() if hasattr(model_to_save, 'proj_audio') else None,
-            'classifier_head': model_to_save.classifier_head.state_dict(),
-            'answer_mapping': self.answer_to_label,
         }
         torch.save(checkpoint, other_params_path)
         logging.info(f"模型已保存至 {self.config.SAVE_DIR}")

@@ -4,6 +4,7 @@
 import argparse
 import contextlib
 import logging
+import math
 import os
 import sys
 import warnings
@@ -29,8 +30,8 @@ except ImportError as exc:  # pragma: no cover
     raise ImportError("Pillow is required. Install via `pip install pillow`." ) from exc
 
 
-DIR_VIDEO = "/root/autodl-tmp/videoblip2/data/MUSIC-AVQA-videos-Synthetic"
-DIR_OUT = "/root/autodl-tmp/videoblip2/data/frame_ViT-L14@336px"
+DIR_VIDEO = "/root/autodl-tmp/videoblip2/data/MSRVTT/video"
+DIR_OUT = "/root/autodl-tmp/videoblip2/data/MSRVTT_frame_ViT"
 DEFAULT_MODEL = "ViT-L-14-336"
 DEFAULT_CKPT = "/root/autodl-tmp/videoblip2/pretrained/ViT-L-14-336px/ViT-L-14-336px.pt"
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
@@ -193,6 +194,7 @@ def parse_args():
     parser.add_argument("--max_frames", type=int, default=64, help="Maximum frames per video (<=0 for no cap)")
     parser.add_argument("--fp16", action="store_true", help="Run encoder in float16 when CUDA is available")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing feature files")
+    parser.add_argument("--num_shards", type=int, default=4, help="Split video list into num_shards chunks; each GPU processes its shard")
     return parser.parse_args()
 
 
@@ -212,6 +214,7 @@ def main():
 
     video_files = [f for f in os.listdir(args.video_dir) if os.path.splitext(f)[1].lower() in VIDEO_EXTS]
     video_files.sort()
+    total_files = len(video_files)
 
     print("=" * 80)
     print("ViT-L/14@336 Frame Feature Extraction (local checkpoint)")
@@ -224,7 +227,24 @@ def main():
     print(f"Batch size : {args.batch_size}, Device: {device}, dtype: {dtype}")
     print("=" * 80)
 
-    pbar = tqdm(video_files, desc="Extracting frame features")
+    if total_files == 0:
+        print("[WARN] No supported video files found; exiting.")
+        return
+
+    num_shards = max(1, args.num_shards)
+    shard_idx = min(max(0, args.gpu_id), num_shards - 1)
+    files_per_shard = math.ceil(total_files / num_shards)
+    start_idx = shard_idx * files_per_shard
+    end_idx = min(total_files, start_idx + files_per_shard)
+    shard_files = video_files[start_idx:end_idx]
+
+    print(f"GPU {args.gpu_id} / shard {shard_idx} processing indices [{start_idx}, {end_idx}) totaling {len(shard_files)} videos.")
+
+    if not shard_files:
+        print("[WARN] Assigned shard has no files to process; exiting.")
+        return
+
+    pbar = tqdm(shard_files, desc="Extracting frame features")
     for fname in pbar:
         vid = os.path.splitext(fname)[0]
         in_path = os.path.join(args.video_dir, fname)

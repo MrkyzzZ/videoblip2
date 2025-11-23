@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
 CLAP音频特征提取脚本
-从视频文件中提取CLAP音频特征，用于Music AVQA数据集预处理
+从视频/音频文件中提取 CLAP 音频特征，用于 Music AVQA 等数据集预处理
 """
 
 # ===================== 填好的路径（可按需修改） =====================
 
 DIR_MODEL = "/root/autodl-tmp/videoblip2/pretrained/clap-htsat-fused"      # 离线下载好的 laion/clap-htsat-fused 本地目录
 
-DIR_VIDEO = "/root/autodl-tmp/videoblip2/data/MUSIC-AVQA-videos-Real" # 原始视频目录（文件名需与 video_id 对应，如 00001234.mp4）
+DIR_VIDEO = "/root/autodl-tmp/videoblip2/data/audio_clips" # 原始视频/音频目录（文件名需与 video_id 对应，如 00001234.mp4 / .wav）
 
-DIR_OUT   = "/root/autodl-tmp/videoblip2/data/clap"                  # 输出 .npy 目录（每个 video_id.npy 是 [T, D]）
+DIR_OUT   = "/root/autodl-tmp/videoblip2/data/MSRVTT_clap"                  # 输出 .npy 目录（每个 video_id.npy 是 [T, D]）
 
 # ================================================================
 
@@ -19,12 +19,15 @@ import argparse
 import numpy as np
 import subprocess
 import shutil
+import math
 import torch
 from tqdm import tqdm
 from transformers import ClapProcessor, ClapModel
 
-# 支持的视频扩展名
+# 支持的媒体扩展名
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
+AUDIO_EXTS = {".wav", ".flac", ".mp3", ".m4a", ".aac"}
+MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS
 
 
 def check_ffmpeg():
@@ -35,7 +38,7 @@ def check_ffmpeg():
         )
 
 
-def load_audio_from_video_ffmpeg(video_path, target_sr=48000):
+def load_audio_with_ffmpeg(media_path, target_sr=48000):
     """
     用 ffmpeg 将视频解码为单声道、target_sr 采样率的 float32 原始PCM，从 stdout 读取为 numpy。
 
@@ -44,7 +47,7 @@ def load_audio_from_video_ffmpeg(video_path, target_sr=48000):
     cmd = [
         "ffmpeg",
         "-v", "error",
-        "-i", video_path,
+        "-i", media_path,
         "-ac", "1",                  # 单声道
         "-ar", str(target_sr),       # 重采样
         "-f", "f32le",               # float32 little-endian 原始PCM
@@ -53,7 +56,7 @@ def load_audio_from_video_ffmpeg(video_path, target_sr=48000):
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"ffmpeg 解码失败: {video_path}\n{e.stderr.decode('utf-8', errors='ignore')}")
+        raise RuntimeError(f"ffmpeg 解码失败: {media_path}\n{e.stderr.decode('utf-8', errors='ignore')}")
 
     audio = np.frombuffer(proc.stdout, dtype=np.float32)
     return audio, target_sr
@@ -89,16 +92,16 @@ def chunk_waveform(wav, sr, win_sec=1.0, hop_sec=1.0, min_len_sec=None):
     return chunks  # List[np.ndarray]，每段长度=win
 
 
-def process_one_video(video_path, processor, model, device, batch_size=64,
+def process_one_media(media_path, processor, model, device, batch_size=64,
                       target_sr=48000, win_sec=1.0, hop_sec=1.0, fp16=False,
                       out_path=None, verbose=True):
-    """处理单个视频文件，提取CLAP音频特征"""
+    """处理单个视频或音频文件，提取 CLAP 音频特征"""
     if verbose:
-        print(f"[INPUT ] {os.path.abspath(video_path)}")
+        print(f"[INPUT ] {os.path.abspath(media_path)}")
         if out_path is not None:
             print(f"[OUTPUT] {os.path.abspath(out_path)}")
 
-    wav, sr = load_audio_from_video_ffmpeg(video_path, target_sr=target_sr)
+    wav, sr = load_audio_with_ffmpeg(media_path, target_sr=target_sr)
     chunks = chunk_waveform(wav, sr, win_sec=win_sec, hop_sec=hop_sec)
 
     # 空音频兜底
@@ -152,11 +155,11 @@ def process_one_video(video_path, processor, model, device, batch_size=64,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract CLAP audio features from videos (OFFLINE, via ffmpeg)")
+    parser = argparse.ArgumentParser(description="Extract CLAP audio features from media files (videos or wav, offline via ffmpeg)")
     parser.add_argument("--model_dir", type=str, default=DIR_MODEL, help="本地 CLAP 模型目录（离线）")
-    parser.add_argument("--video_dir", type=str, default=DIR_VIDEO, help="原始视频目录（mp4/mkv/avi/mov/webm/m4v）")
+    parser.add_argument("--video_dir", type=str, default=DIR_VIDEO, help="原始视频/音频目录（mp4/mkv/avi/mov/webm/m4v/wav/...）")
     parser.add_argument("--out_dir",   type=str, default=DIR_OUT,   help="输出 .npy 目录（每个 video_id.npy 是 [T, D]）")
-    parser.add_argument("--gpu_id",    type=int, default=0,         help="指定使用的GPU ID (默认: 0)")
+    parser.add_argument("--gpu_id",    type=int, default=3,         help="指定使用的GPU ID (默认: 0)")
     parser.add_argument("--device",    type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--win_sec",   type=float, default=1.0)
     parser.add_argument("--hop_sec",   type=float, default=1.0)
@@ -164,6 +167,7 @@ def main():
     parser.add_argument("--batch_size", type=int,  default=64)
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--verbose", action="store_true", default=True)
+    parser.add_argument("--num_shards", type=int, default=4, help="将输入文件划分为 num_shards 份，当前 GPU 仅处理其 --gpu_id 对应的分片")
 
     args = parser.parse_args()
 
@@ -182,10 +186,10 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     print("="*80)
-    print("CLAP Audio Feature Extraction FROM VIDEOS (OFFLINE, ffmpeg)")
+    print("CLAP Audio Feature Extraction FROM MEDIA (OFFLINE, ffmpeg)")
     print("-"*80)
     print(f"Local model dir : {os.path.abspath(args.model_dir)}")
-    print(f"Input VIDEO dir : {os.path.abspath(args.video_dir)}")
+    print(f"Input MEDIA dir : {os.path.abspath(args.video_dir)}")
     print(f"Output NPY dir  : {os.path.abspath(args.out_dir)}")
     print(f"Device          : {args.device}")
     print(f"Window/Hop (s)  : {args.win_sec} / {args.hop_sec}")
@@ -194,14 +198,32 @@ def main():
     processor = ClapProcessor.from_pretrained(args.model_dir, local_files_only=True)
     model     = ClapModel.from_pretrained(args.model_dir,     local_files_only=True).to(args.device)
 
-    # 收集视频文件
-    video_files = [f for f in os.listdir(args.video_dir) if os.path.splitext(f)[1].lower() in VIDEO_EXTS]
-    video_files.sort()
+    # 收集媒体文件
+    media_files = [f for f in os.listdir(args.video_dir) if os.path.splitext(f)[1].lower() in MEDIA_EXTS]
+    media_files.sort()
 
-    print(f"Found {len(video_files)} video files.")
+    total_files = len(media_files)
+    print(f"Found {total_files} media files.")
+
+    if not media_files:
+        print("[WARN] 未在输入目录中找到受支持的媒体文件。")
+
+    # 根据 GPU 分片
+    num_shards = max(1, args.num_shards)
+    shard_idx = min(max(0, args.gpu_id), num_shards - 1)
+    files_per_shard = math.ceil(total_files / num_shards) if total_files else 0
+    start_idx = shard_idx * files_per_shard
+    end_idx = min(total_files, start_idx + files_per_shard)
+    shard_files = media_files[start_idx:end_idx]
+
+    print(f"GPU {args.gpu_id} / shard {shard_idx} processing indices [{start_idx}, {end_idx})，共 {len(shard_files)} 个文件。")
+
+    if not shard_files:
+        print("[WARN] 当前 GPU 分片没有可处理的文件，直接退出。")
+        return
 
     D_printed = False
-    pbar = tqdm(video_files, desc="Extracting CLAP audio features from videos (offline)")
+    pbar = tqdm(shard_files, desc="Extracting CLAP audio features from media files (offline)")
 
     for fname in pbar:
         vid = os.path.splitext(fname)[0]  # 假设文件名就是 video_id
@@ -214,7 +236,7 @@ def main():
                 print(f"[SKIP  ] {vid} -> {os.path.abspath(out_path)} (exists)")
             continue
 
-        feats = process_one_video(
+        feats = process_one_media(
             in_path, processor, model, device=args.device, batch_size=args.batch_size,
             target_sr=args.target_sr, win_sec=args.win_sec, hop_sec=args.hop_sec,
             fp16=args.fp16, out_path=out_path, verbose=args.verbose
