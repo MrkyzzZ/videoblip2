@@ -25,6 +25,8 @@ class TrainConfig:
     # ==============================================================================
     SAVE_DIR = "/root/autodl-tmp/videoblip2/saved_models" 
     LOG_DIR  = "/root/autodl-tmp/videoblip2/logs"          
+    SAMPLE_OUTPUT_DIR = "/root/autodl-tmp/videoblip2/logs/sample_generations"
+    SAMPLE_OUTPUT_COUNT = 5
 
     # ==============================================================================
     # --- 训练超参数 ---
