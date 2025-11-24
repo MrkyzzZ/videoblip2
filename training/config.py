@@ -25,16 +25,16 @@ class TrainConfig:
     # ==============================================================================
     SAVE_DIR = "/root/autodl-tmp/videoblip2/saved_models" 
     LOG_DIR  = "/root/autodl-tmp/videoblip2/logs"          
-    SAMPLE_OUTPUT_DIR = "/root/autodl-tmp/videoblip2/logs/sample_generations"
-    SAMPLE_OUTPUT_COUNT = 5
+    
 
     # ==============================================================================
     # --- 训练超参数 ---
     # ==============================================================================
-    EPOCHS        = 75
-    BATCH_SIZE    = 32
-    LEARNING_RATE = 5e-5
-    WARMUP_RATIO  = 0.05
+    EPOCHS           = 100
+    BATCH_SIZE       = 32
+    LEARNING_RATE    = 8e-5
+    WARMUP_RATIO     = 0.1
+    USE_COSINE_DECAY = True  # 是否启用余弦退火学习率
 
     # ==============================================================================
     # --- 模型架构超参数 ---

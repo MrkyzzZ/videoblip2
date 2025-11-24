@@ -14,7 +14,7 @@ import logging
 import random
 from torch.optim import AdamW
 from datetime import datetime
-from transformers import get_cosine_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
 
 from ..models.multimodal_t5 import MultiModal_T5_Classifier
 from .config import TrainConfig
@@ -46,8 +46,12 @@ class Trainer:
         # 日志设置
         os.makedirs(config.LOG_DIR, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_log_dir = os.path.join(config.LOG_DIR, timestamp)
+        os.makedirs(self.run_log_dir, exist_ok=True)
+        self.sample_text_dir = os.path.join(self.run_log_dir, "test")
+        os.makedirs(self.sample_text_dir, exist_ok=True)
         gpu_tag = "_".join(str(g) for g in self.gpu_ids) if self.gpu_ids else "cpu"
-        self.log_file_path = os.path.join(config.LOG_DIR, f"training_log_{timestamp}_gpu{gpu_tag}.txt")
+        self.log_file_path = os.path.join(self.run_log_dir, f"training_log_gpu{gpu_tag}.txt")
         logging.info(f"本次训练的日志将记录在: {self.log_file_path}")
         self.log_hyperparameters()
 
@@ -139,15 +143,23 @@ class Trainer:
         # 优化器设置
         self.optimizer = AdamW(filter(lambda p: p.requires_grad, self.model.parameters()), lr=config.LEARNING_RATE)
 
-        # 学习率调度器
+        # 学习率调度器（可配置是否启用余弦退火）
+        self.use_cosine_decay = getattr(self.config, "USE_COSINE_DECAY", False)
         steps_per_epoch          = max(1, math.ceil(len(self.train_data) / self.config.BATCH_SIZE))
         self.total_training_steps = steps_per_epoch * self.config.EPOCHS
         self.warmup_steps         = int(self.config.WARMUP_RATIO * self.total_training_steps)
-        self.scheduler = get_cosine_schedule_with_warmup(
-            self.optimizer,
-            num_warmup_steps=self.warmup_steps,
-            num_training_steps=self.total_training_steps
-        )
+        if self.use_cosine_decay:
+            self.scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=self.warmup_steps,
+                num_training_steps=self.total_training_steps
+            )
+        else:
+            self.scheduler = get_linear_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=self.warmup_steps,
+                num_training_steps=self.total_training_steps
+            )
 
         self.best_accuracy = 0.0
         self._nltk_ready = False
@@ -323,7 +335,8 @@ class Trainer:
                 loss.backward()
 
                 self.optimizer.step()
-                self.scheduler.step()
+                if self.scheduler is not None:
+                    self.scheduler.step()
                 global_step += 1
 
                 current_lr = self.optimizer.param_groups[0]['lr']
@@ -357,6 +370,7 @@ class Trainer:
         exact_matches = 0
         all_preds = []
         all_refs = []
+        captured_batch_samples = None
 
         with torch.no_grad():
             for i in tqdm(range(0, len(self.test_anns), self.config.BATCH_SIZE), desc="Evaluating"):
@@ -398,6 +412,21 @@ class Trainer:
                         
                 all_preds.extend(preds)
                 all_refs.extend(batch_all_captions)
+
+                if captured_batch_samples is None:
+                    captured_batch_samples = []
+                    for ann, pred, reference in zip(batch_anns, preds, captions):
+                        vid = ann.get('video_id') or ann.get('id') or ann.get('video')
+                        if vid is None:
+                            video_name = ann.get('video') or ann.get('video_name') or ann.get('media')
+                            if video_name:
+                                vid = os.path.splitext(os.path.basename(str(video_name)))[0]
+                        vid = str(vid) if vid is not None else "unknown"
+                        captured_batch_samples.append({
+                            "video_id": vid,
+                            "reference": reference,
+                            "prediction": pred
+                        })
 
         avg_loss = total_loss / max(1, total_samples)
         accuracy = (exact_matches / max(1, total_samples)) * 100.0
@@ -460,6 +489,17 @@ class Trainer:
                 f.write(header + "\n")
         except Exception as e:
             logging.error(f"无法将评估结果写入日志文件: {e}")
+
+        if captured_batch_samples:
+            sample_file = os.path.join(self.sample_text_dir, f"epoch_{epoch+1:03d}.txt")
+            try:
+                with open(sample_file, 'w') as sample_fp:
+                    for idx, sample in enumerate(captured_batch_samples, start=1):
+                        sample_fp.write(f"# Sample {idx} | Video: {sample['video_id']}\n")
+                        sample_fp.write(f"Ground Truth: {sample['reference']}\n")
+                        sample_fp.write(f"Prediction: {sample['prediction']}\n\n")
+            except Exception as exc:
+                logging.error(f"无法写入评估样本文件 {sample_file}: {exc}")
 
         if is_best:
             self.best_accuracy = accuracy
