@@ -14,8 +14,8 @@ PARENT_DIR = os.path.dirname(PROJECT_ROOT)
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
-from videoblip2.training.trainer import Trainer
-from videoblip2.training.config import TrainConfig
+from videoblip2.training.trainer import Trainer # type: ignore
+from videoblip2.training.config import TrainConfig # type: ignore
 
 
 def _parse_gpu_ids(raw: Optional[str]) -> Optional[List[int]]:

@@ -181,6 +181,7 @@ class Trainer:
     def _prepare_batch(self, annotations, training=True):
         """准备训练批次数据"""
         video_feats_list, audio_feats_list, questions, captions = [], [], [], []
+        video_lengths, audio_lengths = [], []
         for ann in annotations:
             video_id = ann.get('video_id') or ann.get('id') or ann.get('video')
             if video_id is None:
@@ -233,8 +234,13 @@ class Trainer:
             if not os.path.exists(audio_path):
                 continue
 
-            video_feats_list.append(torch.from_numpy(np.load(video_path)).float())
-            audio_feats_list.append(torch.from_numpy(np.load(audio_path)).float())
+            video_feat = torch.from_numpy(np.load(video_path)).float()
+            audio_feat = torch.from_numpy(np.load(audio_path)).float()
+
+            video_feats_list.append(video_feat)
+            audio_feats_list.append(audio_feat)
+            video_lengths.append(video_feat.size(0))
+            audio_lengths.append(audio_feat.size(0))
             questions.append(question)
             
             # 处理答案/字幕
@@ -269,8 +275,13 @@ class Trainer:
         
         video_batch  = nn.utils.rnn.pad_sequence(video_feats_list, batch_first=True).to(self.device)
         audio_batch  = nn.utils.rnn.pad_sequence(audio_feats_list, batch_first=True).to(self.device)
+        video_mask   = torch.zeros(video_batch.size(0), video_batch.size(1), dtype=torch.long, device=self.device)
+        audio_mask   = torch.zeros(audio_batch.size(0), audio_batch.size(1), dtype=torch.long, device=self.device)
+        for idx, (v_len, a_len) in enumerate(zip(video_lengths, audio_lengths)):
+            video_mask[idx, :v_len] = 1
+            audio_mask[idx, :a_len] = 1
         
-        return video_batch, audio_batch, questions, captions, all_captions_batch
+        return video_batch, audio_batch, video_mask, audio_mask, questions, captions, all_captions_batch
 
     def _build_target_tokens(self, captions):
         tokens = self.t5_tokenizer(
@@ -326,11 +337,11 @@ class Trainer:
                 if batch is None:
                     continue
 
-                video_feats, audio_feats, questions, captions, _ = batch
+                video_feats, audio_feats, video_mask, audio_mask, questions, captions, _ = batch
                 labels = self._build_target_tokens(captions)
 
                 self.optimizer.zero_grad()
-                outputs = self.model(video_feats, audio_feats, questions, labels=labels, generate=False)
+                outputs = self.model(video_feats, audio_feats, video_mask, audio_mask, questions, labels=labels, generate=False)
                 loss = outputs['lm_outputs'].loss if outputs['lm_outputs'] is not None else torch.tensor(0.0, device=self.device)
                 loss.backward()
 
@@ -380,14 +391,14 @@ class Trainer:
                 batch = self._prepare_batch(batch_anns, training=False)
                 if batch is None:
                     continue
-                video_feats, audio_feats, questions, captions, batch_all_captions = batch
+                video_feats, audio_feats, video_mask, audio_mask, questions, captions, batch_all_captions = batch
                 if not captions:
                     continue
                 labels = self._build_target_tokens(captions)
                 if labels.size(0) == 0:
                     continue
 
-                outputs = self.model(video_feats, audio_feats, questions, labels=labels, generate=True)
+                outputs = self.model(video_feats, audio_feats, video_mask, audio_mask, questions, labels=labels, generate=True)
 
                 lm_out = outputs['lm_outputs']
                 if lm_out is not None and lm_out.loss is not None:

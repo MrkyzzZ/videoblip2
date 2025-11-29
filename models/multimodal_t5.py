@@ -188,6 +188,8 @@ class MultiModal_T5_Classifier(nn.Module):
     def forward(self,
                 video_features: torch.Tensor,
                 audio_features: torch.Tensor,
+                video_attention_mask: torch.Tensor | None,
+                audio_attention_mask: torch.Tensor | None,
                 questions: list[str],
                 decoder_input_ids: torch.Tensor | None = None,
                 labels: torch.Tensor | None = None,
@@ -221,7 +223,10 @@ class MultiModal_T5_Classifier(nn.Module):
         # 视频Q-Former处理
         video_query = self.video_query_tokens.expand(B, -1, -1)
         video_joint, video_self_mask = self._build_joint_and_mask(video_query, bert_tokens)
-        video_atts = torch.ones(video_features.size()[:-1], dtype=torch.long, device=device)
+        if video_attention_mask is None:
+            video_atts = torch.ones(video_features.size()[:-1], dtype=torch.long, device=device)
+        else:
+            video_atts = video_attention_mask.to(device)
         extended_video_atts = (1.0 - video_atts.unsqueeze(1).unsqueeze(2).float()) * -10000.0
         video_joint_out = self.video_qformer(
             joint_embeds=video_joint,
@@ -236,7 +241,10 @@ class MultiModal_T5_Classifier(nn.Module):
         audio_features_up = self.audio_upscaler(audio_features)
         audio_query = self.audio_query_tokens.expand(B, -1, -1)
         audio_joint, audio_self_mask = self._build_joint_and_mask(audio_query, bert_tokens)
-        audio_atts = torch.ones(audio_features_up.size()[:-1], dtype=torch.long, device=device)
+        if audio_attention_mask is None:
+            audio_atts = torch.ones(audio_features_up.size()[:-1], dtype=torch.long, device=device)
+        else:
+            audio_atts = audio_attention_mask.to(device)
         extended_audio_atts = (1.0 - audio_atts.unsqueeze(1).unsqueeze(2).float()) * -10000.0
         audio_joint_out = self.audio_qformer(
             joint_embeds=audio_joint,
