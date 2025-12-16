@@ -26,12 +26,16 @@ class MultiModal_T5_Classifier(nn.Module):
                  blip2_model_path: str,
                  video_feat_dim: int = 768,
                  audio_feat_dim: int = 512,
+                 clip_patch_dim: int = 1024,  # 新增: 原始 Patch 特征维度
+                 qformer_input_dim: int = 768, # 新增: Q-Former 输入维度
                  bert_tokenizer_name_or_path: str = "bert-base-uncased"):
         super().__init__()
 
         self.d_q = 768
         self.num_video_queries = num_query_token
         self.num_audio_queries = num_query_token
+        self.clip_patch_dim = clip_patch_dim
+        self.qformer_input_dim = qformer_input_dim
 
         # 初始化T5模型和tokenizer
         self.t5_tokenizer = T5TokenizerFast.from_pretrained(t5_model_path)
@@ -58,9 +62,18 @@ class MultiModal_T5_Classifier(nn.Module):
         attn_drop = 0.1
         inter_size = 4 * self.d_q
 
+        # --- 新增: 视频特征降维层 (如果维度不匹配) ---
+        if self.clip_patch_dim != self.qformer_input_dim:
+            self.video_patch_downsampler = nn.Linear(self.clip_patch_dim, self.qformer_input_dim)
+            nn.init.xavier_uniform_(self.video_patch_downsampler.weight)
+            nn.init.zeros_(self.video_patch_downsampler.bias)
+        else:
+            self.video_patch_downsampler = nn.Identity()
+        # -------------------------------------------
+
         self.video_qformer = DualQFormerEncoder(
             num_layers=qformer_num_layers, hidden_size=self.d_q, num_heads=num_heads,
-            dropout_prob=attn_drop, intermediate_size=inter_size, encoder_hidden_size=video_feat_dim
+            dropout_prob=attn_drop, intermediate_size=inter_size, encoder_hidden_size=self.qformer_input_dim
         )
         self.audio_qformer = DualQFormerEncoder(
             num_layers=qformer_num_layers, hidden_size=self.d_q, num_heads=num_heads,
@@ -197,7 +210,7 @@ class MultiModal_T5_Classifier(nn.Module):
                 generation_kwargs: dict | None = None):
         """
         Args:
-            video_features: 视频特征 [B, T_v, D_v]
+            video_features: 视频特征 [B, T, P, D_patch] 或 [B, T, D] (兼容旧格式)
             audio_features: 音频特征 [B, T_a, D_a]
             questions: 文本提示/问题
             decoder_input_ids: 训练阶段可显式传入 decoder 输入
@@ -215,6 +228,27 @@ class MultiModal_T5_Classifier(nn.Module):
         device = video_features.device
         B = video_features.size(0)
 
+        # --- 处理 Patch 级特征 ---
+        if video_features.dim() == 4:
+            # 1) Patch 特征: (B, T, P, C_patch)
+            video_features_down = self.video_patch_downsampler(video_features)
+            # 2) 展平: (B, T, P, C_q) -> (B, T*P, C_q)
+            video_features_flat = video_features_down.view(B, -1, self.qformer_input_dim)
+        else:
+            # 兼容旧的帧级特征: (B, T, C)
+            if video_features.size(-1) == self.clip_patch_dim:
+                # 输入仍是 1024，则先降维
+                video_features_flat = self.video_patch_downsampler(video_features)
+            elif video_features.size(-1) == self.qformer_input_dim:
+                # 输入已是 768，则不再降维
+                video_features_flat = video_features
+            else:
+                raise ValueError(
+                    f"Unexpected video feature dim: {video_features.size(-1)}, "
+                    f"expected {self.clip_patch_dim} or {self.qformer_input_dim}"
+                )
+        # -----------------------
+
         # 处理问题文本
         bert_tokens = self.bert_tokenizer(
             questions, padding="longest", truncation=True, return_tensors="pt"
@@ -223,15 +257,26 @@ class MultiModal_T5_Classifier(nn.Module):
         # 视频Q-Former处理
         video_query = self.video_query_tokens.expand(B, -1, -1)
         video_joint, video_self_mask = self._build_joint_and_mask(video_query, bert_tokens)
+        
+        # 修正 Attention Mask
+        # 如果传入了 mask，需要适配展平后的维度；如果没有，则全 1
         if video_attention_mask is None:
-            video_atts = torch.ones(video_features.size()[:-1], dtype=torch.long, device=device)
+            video_atts = torch.ones(video_features_flat.size()[:-1], dtype=torch.long, device=device)
         else:
-            video_atts = video_attention_mask.to(device)
+            # 如果 mask 是 (B, T)，需要扩展到 (B, T*P)
+            # 这里假设 mask 只是针对时间维度的 padding mask
+            if video_features.dim() == 4:
+                # (B, T) -> (B, T, 1) -> (B, T, P) -> (B, T*P)
+                P = video_features.size(2)
+                video_atts = video_attention_mask.unsqueeze(-1).expand(-1, -1, P).reshape(B, -1).to(device)
+            else:
+                video_atts = video_attention_mask.to(device)
+                
         extended_video_atts = (1.0 - video_atts.unsqueeze(1).unsqueeze(2).float()) * -10000.0
         video_joint_out = self.video_qformer(
             joint_embeds=video_joint,
             num_query_tokens=self.num_video_queries,
-            encoder_hidden_states=video_features,
+            encoder_hidden_states=video_features_flat,
             encoder_attention_mask=extended_video_atts,
             self_attn_mask=video_self_mask
         )
@@ -292,8 +337,12 @@ class MultiModal_T5_Classifier(nn.Module):
         generated_text = None
         if generate:
             gen_kwargs = generation_kwargs.copy() if generation_kwargs else {}
-            gen_kwargs.setdefault("max_length", 32)
-            gen_kwargs.setdefault("num_beams", 1)
+            # 收紧生成长度，匹配 MSR-VTT 短字幕；同时轻量约束重复与句长
+
+            gen_kwargs.setdefault("max_length", 24)
+            gen_kwargs.setdefault("num_beams", 3)
+            gen_kwargs.setdefault("length_penalty", 0.85)
+            gen_kwargs.setdefault("repetition_penalty", 1.05)
             generated_ids = self.t5_model.generate(
                 encoder_outputs=encoder_outputs,
                 attention_mask=final_t5_attention_mask,
@@ -302,7 +351,8 @@ class MultiModal_T5_Classifier(nn.Module):
             generated_text = self.t5_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
         return {
-            "encoder_hidden_states": encoder_hidden,
+            "encoder_hidden_states": encoder_outputs,
+            "encoder_attention_mask": final_t5_attention_mask,
             "lm_outputs": lm_outputs,
             "generated_ids": generated_ids,
             "generated_text": generated_text,

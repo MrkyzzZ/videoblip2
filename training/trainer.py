@@ -128,6 +128,8 @@ class Trainer:
             lora_alpha=config.LORA_ALPHA,
             lora_dropout=config.LORA_DROPOUT,
             blip2_model_path=config.BLIP2_MODEL_PATH,
+            clip_patch_dim=getattr(config, "CLIP_PATCH_DIM", 1024),
+            qformer_input_dim=getattr(config, "QFORMER_INPUT_DIM", 768),
             bert_tokenizer_name_or_path=getattr(config, "BERT_TOKENIZER_PATH", "bert-base-uncased")
         ).to(self.device)
 
