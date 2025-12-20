@@ -15,6 +15,7 @@ import random
 from torch.optim import AdamW
 from datetime import datetime
 from transformers import get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
+from peft import PeftModel, set_peft_model_state_dict
 
 from ..models.multimodal_t5 import MultiModal_T5_Classifier
 from .config import TrainConfig
@@ -23,8 +24,9 @@ from .config import TrainConfig
 class Trainer:
     """多模态视听问答模型训练器"""
 
-    def __init__(self, config, gpu_ids=None):
+    def __init__(self, config, gpu_ids=None, enable_logging=True):
         self.config = config
+        self.enable_logging = enable_logging
 
         if gpu_ids is None:
             num_cuda = torch.cuda.device_count()
@@ -44,16 +46,24 @@ class Trainer:
             self.gpu_ids = []
 
         # 日志设置
-        os.makedirs(config.LOG_DIR, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.run_log_dir = os.path.join(config.LOG_DIR, timestamp)
-        os.makedirs(self.run_log_dir, exist_ok=True)
-        self.sample_text_dir = os.path.join(self.run_log_dir, "test")
-        os.makedirs(self.sample_text_dir, exist_ok=True)
-        gpu_tag = "_".join(str(g) for g in self.gpu_ids) if self.gpu_ids else "cpu"
-        self.log_file_path = os.path.join(self.run_log_dir, f"training_log_gpu{gpu_tag}.txt")
-        logging.info(f"本次训练的日志将记录在: {self.log_file_path}")
-        self.log_hyperparameters()
+        if self.enable_logging:
+            os.makedirs(config.LOG_DIR, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.run_log_dir = os.path.join(config.LOG_DIR, timestamp)
+            os.makedirs(self.run_log_dir, exist_ok=True)
+            self.sample_text_dir = os.path.join(self.run_log_dir, "test")
+            os.makedirs(self.sample_text_dir, exist_ok=True)
+            self.best_model_dir = os.path.join(self.run_log_dir, "best_model")
+            os.makedirs(self.best_model_dir, exist_ok=True)
+            gpu_tag = "_".join(str(g) for g in self.gpu_ids) if self.gpu_ids else "cpu"
+            self.log_file_path = os.path.join(self.run_log_dir, f"training_log_gpu{gpu_tag}.txt")
+            logging.info(f"本次训练的日志将记录在: {self.log_file_path}")
+            self.log_hyperparameters()
+        else:
+            self.run_log_dir = None
+            self.sample_text_dir = None
+            self.best_model_dir = None
+            self.log_file_path = None
 
         # 数据加载
         train_anns      = json.load(open(config.TRAIN_ANNOTATIONS_PATH, 'r'))
@@ -163,9 +173,8 @@ class Trainer:
                 num_training_steps=self.total_training_steps
             )
 
-        self.best_accuracy = 0.0
+        self.best_cider = float('-inf')
         self._nltk_ready = False
-        os.makedirs(config.SAVE_DIR, exist_ok=True)
         logging.info("Trainer 初始化完成。")
         logging.info(f"总训练步数: {self.total_training_steps}, Warmup 步数: {self.warmup_steps}")
 
@@ -184,6 +193,7 @@ class Trainer:
         """准备训练批次数据"""
         video_feats_list, audio_feats_list, questions, captions = [], [], [], []
         video_lengths, audio_lengths = [], []
+        valid_annotations = []
         for ann in annotations:
             video_id = ann.get('video_id') or ann.get('id') or ann.get('video')
             if video_id is None:
@@ -236,8 +246,17 @@ class Trainer:
             if not os.path.exists(audio_path):
                 continue
 
-            video_feat = torch.from_numpy(np.load(video_path)).float()
-            audio_feat = torch.from_numpy(np.load(audio_path)).float()
+            try:
+                video_feat = torch.from_numpy(np.load(video_path)).float()
+            except Exception as exc:
+                logging.warning(f"跳过损坏的视频特征文件 {video_path}: {exc}")
+                continue
+
+            try:
+                audio_feat = torch.from_numpy(np.load(audio_path)).float()
+            except Exception as exc:
+                logging.warning(f"跳过损坏的音频特征文件 {audio_path}: {exc}")
+                continue
 
             video_feats_list.append(video_feat)
             audio_feats_list.append(audio_feat)
@@ -263,6 +282,7 @@ class Trainer:
                 all_answers_for_sample = [selected_answer]
 
             captions.append(selected_answer)
+            valid_annotations.append(ann)
             # 额外返回该样本的所有参考答案，用于评估
             if not hasattr(self, '_temp_all_captions_list'):
                 self._temp_all_captions_list = []
@@ -283,7 +303,7 @@ class Trainer:
             video_mask[idx, :v_len] = 1
             audio_mask[idx, :a_len] = 1
         
-        return video_batch, audio_batch, video_mask, audio_mask, questions, captions, all_captions_batch
+        return video_batch, audio_batch, video_mask, audio_mask, questions, captions, all_captions_batch, valid_annotations
 
     def _build_target_tokens(self, captions):
         tokens = self.t5_tokenizer(
@@ -339,7 +359,7 @@ class Trainer:
                 if batch is None:
                     continue
 
-                video_feats, audio_feats, video_mask, audio_mask, questions, captions, _ = batch
+                video_feats, audio_feats, video_mask, audio_mask, questions, captions, _, _ = batch
                 labels = self._build_target_tokens(captions)
 
                 self.optimizer.zero_grad()
@@ -355,9 +375,9 @@ class Trainer:
                 current_lr = self.optimizer.param_groups[0]['lr']
                 progress_bar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{current_lr:.2e}")
 
-            self.evaluate(epoch)
+            self.evaluate(epoch, save_best=True)
 
-    def evaluate(self, epoch):
+    def evaluate(self, epoch, save_best=True):
         """评估模型性能，包含 BLEU-1, BLEU-4, METEOR, ROUGE-L, CIDEr"""
         self.model.eval()
 
@@ -380,7 +400,6 @@ class Trainer:
 
         total_loss = 0.0
         total_samples = 0
-        exact_matches = 0
         all_preds = []
         all_refs = []
         captured_batch_samples = None
@@ -393,7 +412,7 @@ class Trainer:
                 batch = self._prepare_batch(batch_anns, training=False)
                 if batch is None:
                     continue
-                video_feats, audio_feats, video_mask, audio_mask, questions, captions, batch_all_captions = batch
+                video_feats, audio_feats, video_mask, audio_mask, questions, captions, batch_all_captions, batch_valid_anns = batch
                 if not captions:
                     continue
                 labels = self._build_target_tokens(captions)
@@ -417,18 +436,13 @@ class Trainer:
                     else:
                         preds = preds[:len(captions)]
                 
-                # Exact Match 仍然只对比选中的那个（通常是第一个），或者也可以改为对比所有
-                for pred, refs in zip(preds, batch_all_captions):
-                    # 只要匹配任何一个参考答案就算 Exact Match
-                    if any(pred.strip().lower() == r.strip().lower() for r in refs):
-                        exact_matches += 1
-                        
                 all_preds.extend(preds)
                 all_refs.extend(batch_all_captions)
 
                 if captured_batch_samples is None:
                     captured_batch_samples = []
-                    for ann, pred, reference in zip(batch_anns, preds, captions):
+                    align_iter = zip(batch_valid_anns, preds, captions)
+                    for ann, pred, reference in align_iter:
                         vid = ann.get('video_id') or ann.get('id') or ann.get('video')
                         if vid is None:
                             video_name = ann.get('video') or ann.get('video_name') or ann.get('media')
@@ -442,8 +456,6 @@ class Trainer:
                         })
 
         avg_loss = total_loss / max(1, total_samples)
-        accuracy = (exact_matches / max(1, total_samples)) * 100.0
-        is_best = accuracy > self.best_accuracy
 
         # 计算 BLEU-1, BLEU-4, METEOR, ROUGE-L, CIDEr
         bleu1s, bleu4s = [], []
@@ -494,16 +506,19 @@ class Trainer:
             except Exception as exc:
                 logging.warning(f"CIDEr 计算失败: {exc}")
 
-        header = f"-------------- Epoch: {epoch+1}, Loss: {avg_loss:.4f}, Exact Match: {accuracy:.2f}% BLEU-1: {bleu1:.4f} BLEU-4: {bleu4:.4f} METEOR: {meteor:.4f} ROUGE-L: {rouge_l:.4f} CIDEr: {cider:.4f}{'  <-- New Best!' if is_best else ''} --------------"
+        is_best = cider > self.best_cider
+        best_suffix = "  <-- New Best!" if (save_best and is_best) else ""
+        header = f"-------------- Epoch: {epoch+1}, Loss: {avg_loss:.4f}, BLEU-1: {bleu1:.4f} BLEU-4: {bleu4:.4f} METEOR: {meteor:.4f} ROUGE-L: {rouge_l:.4f} CIDEr: {cider:.4f}{best_suffix} --------------"
         print("\n" + header)
 
-        try:
-            with open(self.log_file_path, 'a') as f:
-                f.write(header + "\n")
-        except Exception as e:
-            logging.error(f"无法将评估结果写入日志文件: {e}")
+        if self.enable_logging:
+            try:
+                with open(self.log_file_path, 'a') as f:
+                    f.write(header + "\n")
+            except Exception as e:
+                logging.error(f"无法将评估结果写入日志文件: {e}")
 
-        if captured_batch_samples:
+        if self.enable_logging and captured_batch_samples:
             sample_file = os.path.join(self.sample_text_dir, f"epoch_{epoch+1:03d}.txt")
             try:
                 with open(sample_file, 'w') as sample_fp:
@@ -514,15 +529,106 @@ class Trainer:
             except Exception as exc:
                 logging.error(f"无法写入评估样本文件 {sample_file}: {exc}")
 
-        if is_best:
-            self.best_accuracy = accuracy
-            logging.info(f"发现新的最佳准确率: {self.best_accuracy:.2f}%。正在保存模型...")
+        if save_best and is_best:
+            self.best_cider = cider
+            logging.info(f"发现新的最佳 CIDEr: {self.best_cider:.4f}。正在保存模型...")
             self.save_model()
+
+    def load_checkpoint(self, checkpoint_dir=None):
+        """加载已保存的最佳模型，返回是否加载成功。"""
+        ckpt_dir = checkpoint_dir or self.config.SAVE_DIR
+        lora_dir = os.path.join(ckpt_dir, "best_lora_adapters")
+        other_params_path = os.path.join(ckpt_dir, "best_other_params.pth")
+
+        if not os.path.isdir(lora_dir):
+            logging.error(f"未找到 LoRA 目录: {lora_dir}")
+            return False
+        if not os.path.isfile(other_params_path):
+            logging.error(f"未找到参数文件: {other_params_path}")
+            return False
+
+        model_to_load = self.model.module if hasattr(self.model, 'module') else self.model
+
+        try:
+            # 加载 LoRA 适配器
+            if isinstance(model_to_load.t5_model, PeftModel):
+                # 如果已经是 PeftModel，加载 adapter 权重覆盖当前权重
+                # 注意：load_adapter 会加载一个新的 adapter，我们需要确保它是 active 的
+                # 或者我们可以简单地使用 set_peft_model_state_dict 如果我们手动加载 safetensors
+                # 但 load_adapter 是更高级的 API
+                # 为了避免重复添加 adapter，我们先尝试加载
+                try:
+                    model_to_load.t5_model.load_adapter(lora_dir, adapter_name="default", is_trainable=True)
+                    # 确保它是活动的
+                    model_to_load.t5_model.set_adapter("default")
+                    logging.info(f"已通过 load_adapter 加载 LoRA 适配器: {lora_dir}")
+                except Exception as e:
+                    logging.warning(f"load_adapter 失败，尝试重新 wrap: {e}")
+                    # 回退方案：重新 wrap (可能会有问题，如果 base_model 已经被修改)
+                    # 但通常 base_model 在 get_peft_model 后是持有原始权重的引用（部分被替换）
+                    # 比较安全的做法可能是直接加载 state_dict
+                    from peft.utils.save_and_load import load_peft_weights
+                    adapters_weights = load_peft_weights(lora_dir)
+                    set_peft_model_state_dict(model_to_load.t5_model, adapters_weights)
+                    logging.info(f"已通过 set_peft_model_state_dict 加载 LoRA 适配器: {lora_dir}")
+
+            else:
+                model_to_load.t5_model = PeftModel.from_pretrained(model_to_load.t5_model, lora_dir)
+                logging.info(f"已通过 from_pretrained 加载 LoRA 适配器: {lora_dir}")
+            
+            model_to_load.t5_model.to(self.device)
+            
+        except Exception as exc:
+            logging.error(f"加载 LoRA 适配器失败: {exc}")
+            # 不返回 False，尝试继续加载其他参数，看看是否只是 LoRA 的问题
+
+
+        try:
+            state = torch.load(other_params_path, map_location=self.device)
+        except Exception as exc:
+            logging.error(f"读取参数文件失败: {exc}")
+            return False
+
+        def _load_state(module, key):
+            if module is None:
+                return
+            sd = state.get(key)
+            if sd is None:
+                logging.warning(f"参数 {key} 不存在于检查点，跳过加载。")
+                return
+            msg = module.load_state_dict(sd, strict=False)
+            logging.info(f"加载 {key}: {msg}")
+
+        _load_state(model_to_load.video_qformer, 'video_qformer')
+        _load_state(model_to_load.audio_qformer, 'audio_qformer')
+        _load_state(model_to_load.bert_embedding, 'bert_embedding')
+        _load_state(model_to_load.audio_upscaler, 'audio_upscaler')
+        _load_state(model_to_load.video_patch_downsampler, 'video_patch_downsampler')
+        _load_state(model_to_load.proj_video, 'proj_video')
+        _load_state(model_to_load.proj_audio, 'proj_audio')
+
+        def _load_param(param, key):
+            tensor = state.get(key)
+            if tensor is None:
+                logging.warning(f"参数 {key} 不存在于检查点，跳过加载。")
+                return
+            try:
+                param.data.copy_(tensor.to(self.device))
+                logging.info(f"加载参数 {key} 成功")
+            except Exception as exc:
+                logging.warning(f"加载参数 {key} 失败: {exc}")
+
+        _load_param(model_to_load.video_query_tokens, 'video_query_tokens')
+        _load_param(model_to_load.audio_query_tokens, 'audio_query_tokens')
+
+        self.best_model_dir = ckpt_dir
+        logging.info(f"检查点加载完成: {ckpt_dir}")
+        return True
 
     def save_model(self):
         """保存模型权重"""
-        lora_path         = os.path.join(self.config.SAVE_DIR, "best_lora_adapters")
-        other_params_path = os.path.join(self.config.SAVE_DIR, "best_other_params.pth")
+        lora_path         = os.path.join(self.best_model_dir, "best_lora_adapters")
+        other_params_path = os.path.join(self.best_model_dir, "best_other_params.pth")
         model_to_save     = self.model.module if hasattr(self.model, 'module') else self.model
         model_to_save.t5_model.save_pretrained(lora_path)
         checkpoint = {
@@ -532,8 +638,9 @@ class Trainer:
             'video_query_tokens': model_to_save.video_query_tokens,
             'audio_query_tokens': model_to_save.audio_query_tokens,
             'audio_upscaler': model_to_save.audio_upscaler.state_dict() if hasattr(model_to_save, 'audio_upscaler') else None,
+            'video_patch_downsampler': model_to_save.video_patch_downsampler.state_dict() if hasattr(model_to_save, 'video_patch_downsampler') else None,
             'proj_video': model_to_save.proj_video.state_dict() if hasattr(model_to_save, 'proj_video') else None,
             'proj_audio': model_to_save.proj_audio.state_dict() if hasattr(model_to_save, 'proj_audio') else None,
         }
         torch.save(checkpoint, other_params_path)
-        logging.info(f"模型已保存至 {self.config.SAVE_DIR}")
+        logging.info(f"模型已保存至 {self.best_model_dir}")

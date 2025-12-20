@@ -12,7 +12,7 @@ class TrainConfig:
     # ==============================================================================
     TRAIN_ANNOTATIONS_PATH = "/root/autodl-tmp/videoblip2/data/MSRVTT_annots/train.json"
     TEST_ANNOTATIONS_PATH  = "/root/autodl-tmp/videoblip2/data/MSRVTT_annots/test.json"
-    VIDEO_FEATURES_DIR   = "/root/autodl-tmp/videoblip2/data/MSRVTT_frame_ViT"
+    VIDEO_FEATURES_DIR   = "/root/autodl-tmp/videoblip2/data/MSRVTT_patchlevel_Vit"
     AUDIO_FEATURES_DIR   = "/root/autodl-tmp/videoblip2/data/MSRVTT_clap"
     T5_MODEL_PATH        = "/root/autodl-tmp/videoblip2/pretrained/flan-t5-large"
     BERT_TOKENIZER_PATH  = "/root/autodl-tmp/videoblip2/pretrained/bert-base-uncased"
@@ -32,7 +32,7 @@ class TrainConfig:
     # ==============================================================================
     EPOCHS           = 200
     BATCH_SIZE       = 8   # 降低 Batch Size 以适配 Patch 级特征的显存消耗
-    LEARNING_RATE    = 2e-5
+    LEARNING_RATE    = 5e-6
     WARMUP_RATIO     = 0.15
     USE_COSINE_DECAY = True  # 是否启用余弦退火学习率
 

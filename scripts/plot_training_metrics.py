@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Parse training_log_gpu*.txt and plot Loss / ExactMatch / BLEU / METEOR / ROUGE-L / CIDEr vs epoch.
+"""Parse training_log_gpu*.txt and plot Loss / BLEU / METEOR / ROUGE-L / CIDEr vs epoch.
 
 Usage:
     python scripts/plot_training_metrics.py \
-        --log /root/autodl-tmp/videoblip2/logs/20251216_140448/training_log_gpu0.txt \
-        --out /root/autodl-tmp/videoblip2/logs/20251216_140448/metrics.png
+        --log /root/autodl-tmp/videoblip2/logs/20251217_125210/training_log_gpu0.txt \
+        --out /root/autodl-tmp/videoblip2/logs/20251217_125210/metrics.png
 
 Requires matplotlib: pip install matplotlib
 """
@@ -14,10 +14,9 @@ import re
 from pathlib import Path
 import matplotlib.pyplot as plt
 
-# Regex to capture metrics from log lines
+# Regex to capture metrics from log lines (no Exact Match field in latest logs)
 LINE_RE = re.compile(
     r"Epoch:\s*(?P<epoch>\d+),\s*Loss:\s*(?P<loss>[0-9.]+).*?"
-    r"Exact Match:\s*(?P<em>[0-9.]+)%.*?"
     r"BLEU-1:\s*(?P<bleu1>[0-9.]+).*?"
     r"BLEU-4:\s*(?P<bleu4>[0-9.]+).*?"
     r"METEOR:\s*(?P<meteor>[0-9.]+).*?"
@@ -28,7 +27,7 @@ LINE_RE = re.compile(
 
 def parse_log(log_path: Path):
     data = {
-        "epoch": [], "loss": [], "em": [], "bleu1": [], "bleu4": [],
+        "epoch": [], "loss": [], "bleu1": [], "bleu4": [],
         "meteor": [], "rouge": [], "cider": [],
     }
     with log_path.open("r", encoding="utf-8") as f:
@@ -39,7 +38,6 @@ def parse_log(log_path: Path):
             gd = m.groupdict()
             data["epoch"].append(int(gd["epoch"]))
             data["loss"].append(float(gd["loss"]))
-            data["em"].append(float(gd["em"]))
             data["bleu1"].append(float(gd["bleu1"]))
             data["bleu4"].append(float(gd["bleu4"]))
             data["meteor"].append(float(gd["meteor"]))
@@ -52,57 +50,49 @@ def plot_curves(data, out_path: Path):
     if not data["epoch"]:
         raise ValueError("No metrics found in log; check the log format or path.")
 
-    plt.figure(figsize=(12, 10))
+    fig, axes = plt.subplots(3, 2, figsize=(12, 10))
+    ax = axes.flatten()
 
     # Loss
-    plt.subplot(3, 2, 1)
-    plt.plot(data["epoch"], data["loss"], label="Loss", color="tab:blue")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Loss")
-    plt.grid(True, alpha=0.3)
-
-    # Exact Match
-    plt.subplot(3, 2, 2)
-    plt.plot(data["epoch"], data["em"], label="Exact Match (%)", color="tab:green")
-    plt.xlabel("Epoch")
-    plt.ylabel("Exact Match (%)")
-    plt.title("Exact Match")
-    plt.grid(True, alpha=0.3)
+    ax[0].plot(data["epoch"], data["loss"], label="Loss", color="tab:blue")
+    ax[0].set_xlabel("Epoch")
+    ax[0].set_ylabel("Loss")
+    ax[0].set_title("Loss")
+    ax[0].grid(True, alpha=0.3)
 
     # BLEU-1 / BLEU-4
-    plt.subplot(3, 2, 3)
-    plt.plot(data["epoch"], data["bleu1"], label="BLEU-1", color="tab:orange")
-    plt.plot(data["epoch"], data["bleu4"], label="BLEU-4", color="tab:red")
-    plt.xlabel("Epoch")
-    plt.ylabel("Score")
-    plt.title("BLEU")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    ax[1].plot(data["epoch"], data["bleu1"], label="BLEU-1", color="tab:orange")
+    ax[1].plot(data["epoch"], data["bleu4"], label="BLEU-4", color="tab:red")
+    ax[1].set_xlabel("Epoch")
+    ax[1].set_ylabel("Score")
+    ax[1].set_title("BLEU")
+    ax[1].legend()
+    ax[1].grid(True, alpha=0.3)
 
     # METEOR
-    plt.subplot(3, 2, 4)
-    plt.plot(data["epoch"], data["meteor"], label="METEOR", color="tab:purple")
-    plt.xlabel("Epoch")
-    plt.ylabel("Score")
-    plt.title("METEOR")
-    plt.grid(True, alpha=0.3)
+    ax[2].plot(data["epoch"], data["meteor"], label="METEOR", color="tab:purple")
+    ax[2].set_xlabel("Epoch")
+    ax[2].set_ylabel("Score")
+    ax[2].set_title("METEOR")
+    ax[2].grid(True, alpha=0.3)
 
     # ROUGE-L
-    plt.subplot(3, 2, 5)
-    plt.plot(data["epoch"], data["rouge"], label="ROUGE-L", color="tab:brown")
-    plt.xlabel("Epoch")
-    plt.ylabel("Score")
-    plt.title("ROUGE-L")
-    plt.grid(True, alpha=0.3)
+    ax[3].plot(data["epoch"], data["rouge"], label="ROUGE-L", color="tab:brown")
+    ax[3].set_xlabel("Epoch")
+    ax[3].set_ylabel("Score")
+    ax[3].set_title("ROUGE-L")
+    ax[3].grid(True, alpha=0.3)
 
     # CIDEr
-    plt.subplot(3, 2, 6)
-    plt.plot(data["epoch"], data["cider"], label="CIDEr", color="tab:cyan")
-    plt.xlabel("Epoch")
-    plt.ylabel("Score")
-    plt.title("CIDEr")
-    plt.grid(True, alpha=0.3)
+    ax[4].plot(data["epoch"], data["cider"], label="CIDEr", color="tab:cyan")
+    ax[4].set_xlabel("Epoch")
+    ax[4].set_ylabel("Score")
+    ax[4].set_title("CIDEr")
+    ax[4].grid(True, alpha=0.3)
+
+    # Remove unused subplot if present
+    if len(ax) > 5:
+        fig.delaxes(ax[5])
 
     plt.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)

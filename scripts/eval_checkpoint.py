@@ -27,7 +27,7 @@ def parse_args():
                         help="Directory containing best_lora_adapters/ and best_other_params.pth; defaults to TrainConfig.SAVE_DIR")
     parser.add_argument("--gpu_ids", type=str, default=None,
                         help="GPU ids, e.g., '0,1' or leave empty for auto")
-    parser.add_argument("--batch_size", type=int, default=None,
+    parser.add_argument("--batch_size", type=int, default=8,
                         help="Override eval batch size (defaults to TrainConfig.BATCH_SIZE)")
     parser.add_argument("--log_level", type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -54,7 +54,7 @@ def main():
     if args.batch_size:
         config.BATCH_SIZE = args.batch_size
 
-    trainer = Trainer(config, gpu_ids=parse_gpu_ids(args.gpu_ids))
+    trainer = Trainer(config, gpu_ids=parse_gpu_ids(args.gpu_ids), enable_logging=False)
 
     if not trainer.load_checkpoint(args.checkpoint_dir):
         logging.error("Failed to load checkpoint. Abort eval.")

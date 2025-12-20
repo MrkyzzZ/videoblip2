@@ -243,6 +243,26 @@ def extract_frames_from_video(video_path, frame_rate=1):
 
 # --- 提取视频中每一帧的patch级别特征 (使用新模型) ---
 def ImageClIP_Patch_feat_extract(dir_fps_path, dst_clip_path):
+    def _is_complete_feature_file(path):
+        try:
+            arr = np.load(path)
+        except Exception as exc:
+            print(f"Found existing feature file but failed to load {path}: {exc}")
+            return False, None
+
+        if arr.ndim != 3:
+            print(f"Found existing feature file with unexpected ndim at {path}: {arr.ndim}")
+            return False, arr.shape
+
+        if arr.shape[1] != new_patch_nums or arr.shape[2] != C or arr.shape[0] == 0:
+            print(
+                f"Found existing feature file with shape mismatch at {path}: {arr.shape}, "
+                f"expected (*, {new_patch_nums}, {C})"
+            )
+            return False, arr.shape
+
+        return True, arr.shape
+
     video_list = os.listdir(dir_fps_path)
     video_idx = 0
     total_nums = len(video_list)
@@ -255,8 +275,11 @@ def ImageClIP_Patch_feat_extract(dir_fps_path, dst_clip_path):
         save_file = os.path.join(dst_clip_path, video_name_without_ext + '.npy')
 
         if os.path.exists(save_file):
-            print(f"{save_file} is already processed!")
-            continue
+            ok, shape = _is_complete_feature_file(save_file)
+            if ok:
+                print(f"{save_file} is already processed and valid. Shape: {shape}")
+                continue
+            print(f"{save_file} exists but is incomplete or corrupted. Recomputing...")
 
         video_path = os.path.join(dir_fps_path, video)
         frames = extract_frames_from_video(video_path)
