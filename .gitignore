@@ -5,6 +5,7 @@ __pycache__/
 
 # C extensions
 *.so
+指令.txt
 
 # Distribution / packaging
 .Python

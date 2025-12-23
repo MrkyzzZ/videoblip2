@@ -3,8 +3,8 @@
 
 Usage:
     python scripts/plot_training_metrics.py \
-        --log /root/autodl-tmp/videoblip2/logs/20251217_125210/training_log_gpu0.txt \
-        --out /root/autodl-tmp/videoblip2/logs/20251217_125210/metrics.png
+        --log /root/autodl-tmp/videoblip2/exp/logs/20251220_161311/training_log_gpu0.txt \
+        --out /root/autodl-tmp/videoblip2/exp/logs/20251220_161311/metrics.png
 
 Requires matplotlib: pip install matplotlib
 """

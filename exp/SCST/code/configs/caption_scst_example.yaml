@@ -1,0 +1,129 @@
+# =============================================================================
+# SCST训练配置示例 (Self-Critical Sequence Training)
+# =============================================================================
+#
+# 重要说明：
+# SCST训练需要一个已经用CE（交叉熵）预训练好的基础模型。
+# 请确保 `pretrained` 路径指向一个CE训练好的checkpoint。
+#
+# 运行命令:
+# python -m torch.distributed.run --nproc_per_node=8 train.py \
+#     --cfg-path configs/caption_scst_example.yaml
+# =============================================================================
+
+model:
+  arch: blip2_t5
+  model_type: pretrain_flant5xl
+  load_pretrained: True
+  load_finetuned: False
+
+  # ============================================================================
+  # 【关键】预训练模型路径
+  # 必须是一个CE训练好的checkpoint！
+  # SCST是在CE预训练基础上进行的强化学习微调
+  # ============================================================================
+  pretrained: "/path/to/your/ce_pretrained_checkpoint.pth"
+
+  # 图像/视频配置
+  image_size: 224
+  drop_path_rate: 0
+  use_grad_checkpoint: False
+  vit_precision: "fp16"
+  freeze_vit: True # 冻结视觉编码器
+
+  # ============================================================================
+  # LoRA配置（推荐用于SCST，减少显存占用）
+  # ============================================================================
+  lora: True
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+
+  # Q-Former配置
+  num_query_token: 32
+
+  # T5模型配置
+  t5_model: "google/flan-t5-xl"
+
+  # 生成配置
+  prompt: "a video of"
+
+  # ============================================================================
+  # 【核心】SCST开关
+  # 设置为True启用SCST训练模式
+  # ============================================================================
+  scst: True # https://arxiv.org/abs/1612.00563
+
+# =============================================================================
+# 数据集配置
+# =============================================================================
+datasets:
+  msrvtt_caption: # 数据集名称，根据实际使用的数据集修改
+    vis_processor:
+      train:
+        name: "alpro_video_train"
+        n_frms: 16 # 每个视频采样的帧数
+        image_size: 224
+      eval:
+        name: "alpro_video_eval"
+        n_frms: 16
+        image_size: 224
+    text_processor:
+      train:
+        name: "blip_caption"
+      eval:
+        name: "blip_caption"
+
+# =============================================================================
+# 训练配置
+# =============================================================================
+run:
+  runner: runner_iter # 使用iteration-based训练
+  max_iters: 20000 # 总迭代次数
+  iters_per_inner_epoch: 1000 # 每个epoch的迭代数（用于验证和保存）
+
+  task: captioning
+
+  # ============================================================================
+  # 【关键】学习率配置
+  # SCST的学习率应该比CE训练低1-2个数量级！
+  # ============================================================================
+  lr_sched: "linear_warmup_cosine_lr"
+  init_lr: 1e-5 # 初始学习率（SCST用较小的学习率）
+  min_lr: 1e-6 # 最小学习率
+  warmup_lr: 1e-8 # 预热起始学习率
+  warmup_steps: 1000 # 预热步数
+  weight_decay: 0.05
+
+  max_epoch: 10
+
+  # ============================================================================
+  # 【关键】Batch Size
+  # SCST训练需要采样多个序列，显存占用较大
+  # 建议使用较小的batch size
+  # ============================================================================
+  batch_size_train: 2 # 每GPU的batch size（根据显存调整）
+  batch_size_eval: 2
+  num_workers: 4
+  accum_grad_iters: 1 # 梯度累积（如显存不足可增加此值）
+
+  # 生成配置
+  max_len: 32
+  min_len: 5
+  num_beams: 5 # beam search的beam数量，也是SCST每个样本采样的序列数
+
+  seed: 42
+  output_dir: "output/SCST_Training"
+
+  amp: True # 自动混合精度
+  resume_ckpt_path: null
+
+  evaluate: False
+  train_splits: ["train"]
+  valid_splits: ["val"]
+  test_splits: ["test"]
+
+  device: "cuda"
+  world_size: 1
+  dist_url: "env://"
+  distributed: True

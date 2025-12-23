@@ -6,11 +6,11 @@ VideoBLIP2: 多模态视听问答模型
 __version__ = "1.0.0"
 __author__ = "AutoDL Team"
 
-from .models import MultiModal_T5_Classifier
+from .models import MultiModal_T5_Captioner
 from .training import Trainer, TrainConfig
 
 __all__ = [
-    'MultiModal_T5_Classifier',
+    'MultiModal_T5_Captioner',
     'Trainer',
     'TrainConfig'
 ]

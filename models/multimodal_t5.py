@@ -13,7 +13,7 @@ except ImportError:
 from .base_modules import DualQFormerEncoder
 
 
-class MultiModal_T5_Classifier(nn.Module):
+class MultiModal_T5_Captioner(nn.Module):
     """多模态 T5 Caption 模型，支持音视频特征与文本联合生成"""
     def __init__(self,
                  num_classes: int,
@@ -197,6 +197,105 @@ class MultiModal_T5_Classifier(nn.Module):
         valid = torch.cat([ones_q, bert_tokens.attention_mask], dim=1).float()
         self_attn_mask = (1.0 - valid).unsqueeze(1).unsqueeze(2) * -10000.0
         return joint, self_attn_mask
+
+    def encode_for_t5(self,
+                      video_features: torch.Tensor,
+                      audio_features: torch.Tensor,
+                      video_attention_mask: torch.Tensor | None,
+                      audio_attention_mask: torch.Tensor | None,
+                      questions: list[str]):
+        """复用前向里的多模态编码流程，返回T5编码器输入。
+
+        该方法方便在强化学习/SCST等场景下重复使用视觉+音频编码逻辑，
+        避免复制粘贴前向代码。输出可直接馈入`t5_model.generate`或
+        常规的decoder前向。
+
+        Returns:
+            encoder_outputs: BaseModelOutput，包含编码后的隐藏状态
+            final_t5_attention_mask: torch.Tensor，与encoder_outputs对齐的mask
+            t5_tokens: tokenizer输出，便于后续解码或计算标签
+        """
+        device = video_features.device
+        B = video_features.size(0)
+
+        # --- 处理 Patch 级特征 ---
+        if video_features.dim() == 4:
+            video_features_down = self.video_patch_downsampler(video_features)
+            video_features_flat = video_features_down.view(B, -1, self.qformer_input_dim)
+        else:
+            if video_features.size(-1) == self.clip_patch_dim:
+                video_features_flat = self.video_patch_downsampler(video_features)
+            elif video_features.size(-1) == self.qformer_input_dim:
+                video_features_flat = video_features
+            else:
+                raise ValueError(
+                    f"Unexpected video feature dim: {video_features.size(-1)}, "
+                    f"expected {self.clip_patch_dim} or {self.qformer_input_dim}"
+                )
+
+        bert_tokens = self.bert_tokenizer(
+            questions, padding="longest", truncation=True, return_tensors="pt"
+        ).to(device)
+
+        video_query = self.video_query_tokens.expand(B, -1, -1)
+        video_joint, video_self_mask = self._build_joint_and_mask(video_query, bert_tokens)
+
+        if video_attention_mask is None:
+            video_atts = torch.ones(video_features_flat.size()[:-1], dtype=torch.long, device=device)
+        else:
+            if video_features.dim() == 4:
+                P = video_features.size(2)
+                video_atts = video_attention_mask.unsqueeze(-1).expand(-1, -1, P).reshape(B, -1).to(device)
+            else:
+                video_atts = video_attention_mask.to(device)
+
+        extended_video_atts = (1.0 - video_atts.unsqueeze(1).unsqueeze(2).float()) * -10000.0
+        video_joint_out = self.video_qformer(
+            joint_embeds=video_joint,
+            num_query_tokens=self.num_video_queries,
+            encoder_hidden_states=video_features_flat,
+            encoder_attention_mask=extended_video_atts,
+            self_attn_mask=video_self_mask
+        )
+        video_query_out = video_joint_out[:, :self.num_video_queries, :]
+
+        audio_features_up = self.audio_upscaler(audio_features)
+        audio_query = self.audio_query_tokens.expand(B, -1, -1)
+        audio_joint, audio_self_mask = self._build_joint_and_mask(audio_query, bert_tokens)
+        if audio_attention_mask is None:
+            audio_atts = torch.ones(audio_features_up.size()[:-1], dtype=torch.long, device=device)
+        else:
+            audio_atts = audio_attention_mask.to(device)
+        extended_audio_atts = (1.0 - audio_atts.unsqueeze(1).unsqueeze(2).float()) * -10000.0
+        audio_joint_out = self.audio_qformer(
+            joint_embeds=audio_joint,
+            num_query_tokens=self.num_audio_queries,
+            encoder_hidden_states=audio_features_up,
+            encoder_attention_mask=extended_audio_atts,
+            self_attn_mask=audio_self_mask
+        )
+        audio_query_out = audio_joint_out[:, :self.num_audio_queries, :]
+
+        video_q_for_t5 = self.proj_video(video_query_out)
+        audio_q_for_t5 = self.proj_audio(audio_query_out)
+
+        t5_tokens = self.t5_tokenizer(
+            questions, padding="longest", truncation=True, return_tensors="pt"
+        ).to(device)
+        t5_text_embeds = self.t5_model.get_input_embeddings()(t5_tokens.input_ids)
+
+        inputs_t5 = torch.cat([video_q_for_t5, audio_q_for_t5, t5_text_embeds], dim=1)
+        q_atts = torch.ones((B, self.num_video_queries + self.num_audio_queries), dtype=torch.long, device=device)
+        final_t5_attention_mask = torch.cat([q_atts, t5_tokens.attention_mask], dim=1)
+
+        encoder_hidden = self.t5_model.encoder(
+            inputs_embeds=inputs_t5,
+            attention_mask=final_t5_attention_mask,
+            return_dict=True
+        ).last_hidden_state
+
+        encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden)
+        return encoder_outputs, final_t5_attention_mask, t5_tokens
 
     def forward(self,
                 video_features: torch.Tensor,

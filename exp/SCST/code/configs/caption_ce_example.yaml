@@ -1,0 +1,157 @@
+# =============================================================================
+# CE预训练配置示例 (Cross-Entropy Training)
+# =============================================================================
+#
+# 这是SCST训练的【前置步骤】
+# 必须先用CE训练出一个基础模型，再进行SCST微调
+#
+# 运行命令:
+# python -m torch.distributed.run --nproc_per_node=8 train.py \
+#     --cfg-path configs/caption_ce_example.yaml
+# =============================================================================
+
+model:
+  arch: blip2_t5
+  model_type: pretrain_flant5xl
+  load_pretrained: True
+  load_finetuned: False
+
+  # ============================================================================
+  # 预训练模型路径
+  # 使用BLIP2官方预训练权重，或从HuggingFace下载
+  # ============================================================================
+  pretrained: "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP2/blip2_pretrained_flant5xl.pth"
+  # 或本地路径: "/path/to/blip2_pretrained_flant5xl.pth"
+
+  # 图像/视频配置
+  image_size: 224
+  drop_path_rate: 0
+  use_grad_checkpoint: False
+  vit_precision: "fp16"
+  freeze_vit: True # 冻结视觉编码器以节省显存
+
+  # ============================================================================
+  # LoRA配置
+  # 使用LoRA可以大幅减少可训练参数，节省显存
+  # ============================================================================
+  lora: True
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+
+  # Q-Former配置
+  num_query_token: 32
+
+  # T5模型配置
+  t5_model: "google/flan-t5-xl"
+
+  # 生成配置
+  prompt: "a video of"
+
+  # ============================================================================
+  # 【重要】SCST开关
+  # CE预训练阶段必须设为False
+  # ============================================================================
+  scst: False # CE训练模式
+
+# =============================================================================
+# 数据集配置
+# =============================================================================
+datasets:
+  msrvtt_caption: # 主数据集
+    vis_processor:
+      train:
+        name: "alpro_video_train"
+        n_frms: 8 # CE训练可以用较少的帧数，节省显存
+        image_size: 224
+      eval:
+        name: "alpro_video_eval"
+        n_frms: 8
+        image_size: 224
+    text_processor:
+      train:
+        name: "blip_caption"
+      eval:
+        name: "blip_caption"
+
+  # 可选：加入额外数据集进行联合训练
+  # webvid_2m_msrvtt:
+  #   vis_processor:
+  #       train:
+  #         name: "alpro_video_train"
+  #         n_frms: 8
+  #         image_size: 224
+  #   text_processor:
+  #       train:
+  #         name: "blip_caption"
+
+# =============================================================================
+# 训练配置
+# =============================================================================
+run:
+  # 如果使用多个数据集，可以设置采样比例
+  # train_dataset_ratios:
+  #   msrvtt_caption: 1
+  #   webvid_2m_msrvtt: 7
+
+  runner: runner_iter
+  max_iters: 15000 # 总迭代次数
+  iters_per_inner_epoch: 500
+
+  task: captioning
+
+  # ============================================================================
+  # 学习率配置
+  # CE训练可以使用相对较大的学习率
+  # ============================================================================
+  lr_sched: "linear_warmup_cosine_lr"
+  init_lr: 5e-5 # 初始学习率
+  min_lr: 1e-5 # 最小学习率
+  warmup_lr: 1e-8 # 预热起始学习率
+  warmup_steps: 1000 # 预热步数
+  weight_decay: 0.05
+
+  max_epoch: 20
+
+  # ============================================================================
+  # Batch Size配置
+  # CE训练可以使用较大的batch size
+  # ============================================================================
+  batch_size_train: 64 # 根据GPU显存调整
+  batch_size_eval: 32
+  num_workers: 4
+  accum_grad_iters: 1
+
+  # 生成配置
+  max_len: 32
+  min_len: 5
+  num_beams: 5
+
+  seed: 42
+  output_dir: "output/CE_Pretrain" # CE预训练输出目录
+
+  amp: True
+  resume_ckpt_path: null
+
+  evaluate: False
+  train_splits: ["train"]
+  valid_splits: ["val"]
+  test_splits: ["test"]
+
+  device: "cuda"
+  world_size: 1
+  dist_url: "env://"
+  distributed: True
+# =============================================================================
+# CE训练完成后，使用最佳checkpoint进行SCST训练：
+#
+# 1. 找到CE训练的最佳checkpoint:
+#    output/CE_Pretrain/[timestamp]/checkpoint_best.pth
+#
+# 2. 修改SCST配置文件中的pretrained路径：
+#    pretrained: "output/CE_Pretrain/[timestamp]/checkpoint_best.pth"
+#
+# 3. 运行SCST训练：
+#    python -m torch.distributed.run --nproc_per_node=8 train.py \
+#        --cfg-path configs/caption_scst_example.yaml
+# =============================================================================

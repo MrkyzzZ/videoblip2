@@ -32,7 +32,7 @@ class TrainConfig:
     # ==============================================================================
     EPOCHS           = 200
     BATCH_SIZE       = 8   # 降低 Batch Size 以适配 Patch 级特征的显存消耗
-    LEARNING_RATE    = 5e-6
+    LEARNING_RATE    = 3e-05
     WARMUP_RATIO     = 0.15
     USE_COSINE_DECAY = True  # 是否启用余弦退火学习率
 
